@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS activity (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	process_name TEXT NOT NULL,
+	window_title TEXT NOT NULL,
+	start_time DATETIME NOT NULL,
+	end_time DATETIME NOT NULL,
+	user_name TEXT NOT NULL DEFAULT '',
+	local_ip TEXT NOT NULL DEFAULT '',
+	network_ip TEXT NOT NULL DEFAULT ''
+);

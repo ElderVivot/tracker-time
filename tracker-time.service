@@ -1,0 +1,23 @@
+[Unit]
+Description=Tracker Time - Monitoramento de produtividade (X11)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# %h = home do usuário (expandido automaticamente pelo systemd em serviços --user)
+ExecStart=%h/.local/bin/tracker-time
+# Opcional: variáveis de ambiente (DB e API já têm padrão)
+# Environment=TRACKER_DB_PATH=%h/.local/share/tracker-time/tracker.db
+# Environment=TRACKER_INGEST_URL=https://sua-api.com/v1/ingest
+# Environment=TRACKER_IDLE_THRESHOLD=1m
+
+Restart=on-failure
+RestartSec=10
+
+# Rodar com o usuário da sessão gráfica (necessário para acessar DISPLAY e X11)
+# Não use User= em serviços por usuário; deixe o systemd do usuário gerenciar.
+# Para serviço de usuário: coloque este arquivo em ~/.config/systemd/user/
+
+[Install]
+WantedBy=default.target
