@@ -6,14 +6,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"os/user"
 	"strconv"
@@ -23,18 +21,17 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/jezek/xgb"
-	"github.com/jezek/xgb/xproto"
 )
 
 // --- Constantes de configuração ---
 
 const (
-	monitorInterval    = 2 * time.Second  // Loop rápido: a cada 2s
-	syncInterval       = 10 * time.Minute // Loop lento: a cada 10min
+	monitorInterval      = 2 * time.Second  // Loop rápido: a cada 2s
+	syncInterval         = 10 * time.Minute // Loop lento: a cada 10min
+	connectRetryInterval = 30 * time.Second // Intervalo entre tentativas de conexão ao X11
 	defaultIdleThreshold = 2 * time.Second  // Tempo sem mouse/teclado para considerar inativo (configurável por env)
-	defaultIngestURL    = "https://api.dashboard.com/v1/ingest"
-	defaultTTL          = 168 * time.Hour   // 7 dias: registros mais antigos são apagados (TTL em app, SQLite não tem TTL nativo)
+	defaultIngestURL     = "https://api.dashboard.com/v1/ingest"
+	defaultTTL           = 168 * time.Hour  // 7 dias: registros mais antigos são apagados (TTL em app, SQLite não tem TTL nativo)
 )
 
 // defaultDBPath retorna o caminho padrão do SQLite (diretório do usuário).
@@ -89,6 +86,7 @@ func getIdleThreshold() time.Duration {
 // MachineIdentity guarda dados da máquina/usuário para consolidar no painel do gestor.
 type MachineIdentity struct {
 	UserName  string // nome do usuário do SO
+	Hostname  string // nome da máquina local (hostname)
 	LocalIP   string // IP local (loopback, ex: 127.0.0.1)
 	NetworkIP string // IP na rede (primeira IPv4 não loopback)
 }
@@ -101,6 +99,7 @@ type Record struct {
 	StartTime   time.Time `json:"start_time"`
 	EndTime     time.Time `json:"end_time"`
 	UserName    string    `json:"user_name"`
+	Hostname    string    `json:"hostname"`
 	LocalIP     string    `json:"local_ip"`
 	NetworkIP   string    `json:"network_ip"`
 }
@@ -117,6 +116,7 @@ type IngestEvent struct {
 	StartTime   string `json:"start_time"` // ISO8601
 	EndTime     string `json:"end_time"`
 	UserName    string `json:"user_name"`
+	Hostname    string `json:"hostname"`
 	LocalIP     string `json:"local_ip"`
 	NetworkIP   string `json:"network_ip"`
 }
@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS activity (
 	start_time DATETIME NOT NULL,
 	end_time DATETIME NOT NULL,
 	user_name TEXT NOT NULL DEFAULT '',
+	hostname TEXT NOT NULL DEFAULT '',
 	local_ip TEXT NOT NULL DEFAULT '',
 	network_ip TEXT NOT NULL DEFAULT ''
 );
@@ -138,11 +139,14 @@ CREATE TABLE IF NOT EXISTS activity (
 
 // --- Identidade da máquina (usuário e IPs) ---
 
-// getMachineIdentity obtém nome do usuário, IP local e IP da rede para o gestor consolidar uso por máquina/usuário.
+// getMachineIdentity obtém nome do usuário, hostname, IP local e IP da rede para o gestor consolidar uso por máquina/usuário.
 func getMachineIdentity() MachineIdentity {
 	id := MachineIdentity{LocalIP: "127.0.0.1"}
 	if u, err := user.Current(); err == nil {
 		id.UserName = u.Username
+	}
+	if h, err := os.Hostname(); err == nil {
+		id.Hostname = h
 	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -190,6 +194,7 @@ func initDB(dbPath string) (*sql.DB, error) {
 	}
 	// Migração: adicionar colunas de identidade em bancos já existentes (ignoramos erro se já existirem).
 	_, _ = db.Exec("ALTER TABLE activity ADD COLUMN user_name TEXT NOT NULL DEFAULT ''")
+	_, _ = db.Exec("ALTER TABLE activity ADD COLUMN hostname TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE activity ADD COLUMN local_ip TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE activity ADD COLUMN network_ip TEXT NOT NULL DEFAULT ''")
 	// Migração: remover is_synced em bancos antigos (registros passam a ser apagados após envio).
@@ -197,80 +202,22 @@ func initDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// --- X11: janela ativa e título ---
+// --- Goroutine 1: Monitoramento (loop rápido, com auto-conexão/reconexão X11) ---
 
-// getActiveWindowInfo obtém (processName, windowTitle) da janela ativa via X11.
-// Retorna ("", "", false) em caso de erro ou ausência de X.
-func getActiveWindowInfo(conn *xgb.Conn, root xproto.Window, activeAtom, nameAtom, classAtom xproto.Atom) (processName, windowTitle string, ok bool) {
-	reply, err := xproto.GetProperty(conn, false, root, activeAtom, xproto.GetPropertyTypeAny, 0, 1<<32-1).Reply()
-	if err != nil || reply == nil || len(reply.Value) < 4 {
-		return "", "", false
-	}
-	windowID := xproto.Window(binary.LittleEndian.Uint32(reply.Value))
-
-	// Título da janela (_NET_WM_NAME)
-	reply, err = xproto.GetProperty(conn, false, windowID, nameAtom, xproto.GetPropertyTypeAny, 0, 1<<32-1).Reply()
-	if err == nil && reply != nil && len(reply.Value) > 0 {
-		windowTitle = string(bytes.TrimRight(reply.Value, "\x00"))
-	}
-
-	// WM_CLASS: geralmente "instance\x00class"; usamos a parte "class" como process_name
-	reply, err = xproto.GetProperty(conn, false, windowID, classAtom, xproto.GetPropertyTypeAny, 0, 1<<32-1).Reply()
-	if err == nil && reply != nil && len(reply.Value) > 0 {
-		parts := strings.SplitN(string(reply.Value), "\x00", 3)
-		if len(parts) >= 2 && parts[1] != "" {
-			processName = parts[1]
-		} else if len(parts) >= 1 && parts[0] != "" {
-			processName = parts[0]
-		}
-	}
-	if processName == "" {
-		processName = "unknown"
-	}
-	return processName, windowTitle, true
-}
-
-// getIdleMs retorna o tempo ocioso do usuário em milissegundos (via xprintidle).
-// Se xprintidle não estiver instalado, retorna 0.
-func getIdleMs() int64 {
-	out, err := exec.Command("xprintidle").Output()
-	if err != nil {
-		return 0
-	}
-	ms, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-	return ms
-}
-
-// --- Goroutine 1: Monitoramento (loop rápido) ---
-
-func runMonitor(ctx context.Context, db *sql.DB, dbPath string) {
-	conn, err := xgb.NewConn()
-	if err != nil {
-		log.Printf("[monitor] X11 não disponível (DISPLAY?): %v", err)
-		return
-	}
-	defer conn.Close()
-
-	setup := xproto.Setup(conn)
-	root := setup.DefaultScreen(conn).Root
-
-	activeAtom, _ := xproto.InternAtom(conn, true, uint16(len("_NET_ACTIVE_WINDOW")), "_NET_ACTIVE_WINDOW").Reply()
-	nameAtom, _ := xproto.InternAtom(conn, true, uint16(len("_NET_WM_NAME")), "_NET_WM_NAME").Reply()
-	classAtom, _ := xproto.InternAtom(conn, true, uint16(len("WM_CLASS")), "WM_CLASS").Reply()
-
-	if activeAtom == nil || nameAtom == nil || classAtom == nil {
-		log.Printf("[monitor] falha ao obter átomos X11")
-		return
-	}
-
+func runMonitor(ctx context.Context, db *sql.DB) {
 	identity := getMachineIdentity()
 	idleThreshold := getIdleThreshold()
+	idleProv := X11IdleProvider{}
 
 	var (
-		mu             sync.Mutex
-		currentProcess string
-		currentTitle   string
-		currentID      int64
+		windowProv      WindowProvider
+		cleanup         func()
+		mu              sync.Mutex
+		currentProcess  string
+		currentTitle    string
+		currentID       int64
+		lastConnAttempt time.Time
+		loggedWaiting   bool
 	)
 
 	ticker := time.NewTicker(monitorInterval)
@@ -279,17 +226,59 @@ func runMonitor(ctx context.Context, db *sql.DB, dbPath string) {
 	for {
 		select {
 		case <-ctx.Done():
+			if cleanup != nil {
+				cleanup()
+			}
 			return
 		case <-ticker.C:
-			idleMs := getIdleMs()
-			if time.Duration(idleMs)*time.Millisecond > idleThreshold {
-				// Usuário ocioso: não atualizamos end_time
+			if windowProv == nil {
+				if !lastConnAttempt.IsZero() && time.Since(lastConnAttempt) < connectRetryInterval {
+					continue
+				}
+				lastConnAttempt = time.Now()
+				os.Unsetenv("DISPLAY")
+				wp, cl, err := NewX11WindowProvider()
+				if err != nil {
+					if !loggedWaiting {
+						log.Printf("[monitor] aguardando sessão X11 (%v), retentando a cada %s", err, connectRetryInterval)
+						loggedWaiting = true
+					}
+					continue
+				}
+				windowProv = wp
+				cleanup = cl
+				loggedWaiting = false
+				log.Printf("[monitor] conectado ao X11 (DISPLAY=%s)", os.Getenv("DISPLAY"))
+			}
+
+			idleDur, err := idleProv.IdleDuration()
+			if err != nil {
+				continue
+			}
+			if idleDur > idleThreshold {
 				continue
 			}
 
-			processName, windowTitle, ok := getActiveWindowInfo(conn, root, activeAtom.Atom, nameAtom.Atom, classAtom.Atom)
-			if !ok {
+			processName, windowTitle, err := windowProv.ActiveWindow()
+			if err != nil {
+				log.Printf("[monitor] conexão X11 perdida: %v — reconectando...", err)
+				if cleanup != nil {
+					cleanup()
+				}
+				windowProv = nil
+				cleanup = nil
+				mu.Lock()
+				currentID = 0
+				currentProcess = ""
+				currentTitle = ""
+				mu.Unlock()
 				continue
+			}
+			if processName == "" && windowTitle == "" {
+				continue
+			}
+			if processName == "" {
+				processName = "unknown"
 			}
 
 			now := time.Now()
@@ -309,9 +298,9 @@ func runMonitor(ctx context.Context, db *sql.DB, dbPath string) {
 					)
 				}
 				res, err := db.Exec(
-					`INSERT INTO activity (process_name, window_title, start_time, end_time, user_name, local_ip, network_ip) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO activity (process_name, window_title, start_time, end_time, user_name, hostname, local_ip, network_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					processName, windowTitle, now.Format(time.RFC3339), now.Format(time.RFC3339),
-					identity.UserName, identity.LocalIP, identity.NetworkIP,
+					identity.UserName, identity.Hostname, identity.LocalIP, identity.NetworkIP,
 				)
 				if err != nil {
 					mu.Unlock()
@@ -351,7 +340,7 @@ func runSync(ctx context.Context, db *sql.DB) {
 			}
 
 			rows, err := db.Query(
-				`SELECT id, process_name, window_title, start_time, end_time, user_name, local_ip, network_ip FROM activity ORDER BY id`,
+				`SELECT id, process_name, window_title, start_time, end_time, user_name, hostname, local_ip, network_ip FROM activity ORDER BY id`,
 			)
 			if err != nil {
 				log.Printf("[sync] query: %v", err)
@@ -361,7 +350,7 @@ func runSync(ctx context.Context, db *sql.DB) {
 			for rows.Next() {
 				var r Record
 				var startStr, endStr string
-				if err := rows.Scan(&r.ID, &r.ProcessName, &r.WindowTitle, &startStr, &endStr, &r.UserName, &r.LocalIP, &r.NetworkIP); err != nil {
+				if err := rows.Scan(&r.ID, &r.ProcessName, &r.WindowTitle, &startStr, &endStr, &r.UserName, &r.Hostname, &r.LocalIP, &r.NetworkIP); err != nil {
 					continue
 				}
 				r.StartTime, _ = time.Parse(time.RFC3339, startStr)
@@ -383,6 +372,7 @@ func runSync(ctx context.Context, db *sql.DB) {
 					StartTime:   records[i].StartTime.Format(time.RFC3339),
 					EndTime:     records[i].EndTime.Format(time.RFC3339),
 					UserName:    records[i].UserName,
+					Hostname:    records[i].Hostname,
 					LocalIP:     records[i].LocalIP,
 					NetworkIP:   records[i].NetworkIP,
 				}
@@ -440,7 +430,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go runMonitor(ctx, db, dbPath)
+	go runMonitor(ctx, db)
 	go runSync(ctx, db)
 
 	sig := make(chan os.Signal, 1)

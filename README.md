@@ -1,16 +1,18 @@
 # tracker-time
 
-Daemon de monitoramento de produtividade para Linux (X11). Roda em segundo plano, sem interface gráfica, registrando a janela ativa e o tempo de uso, e sincronizando com uma API REST.
+Daemon de monitoramento de produtividade para Linux (**X11**). Roda em segundo plano, sem interface gráfica, registrando a janela ativa e o tempo de uso, e sincronizando com uma API REST.
 
 ## Requisitos
 
 - **Go** 1.21+
-- **Linux** com servidor X11 (DISPLAY configurado)
-- **xprintidle** (opcional, para tempo ocioso): `sudo apt install xprintidle` (Debian/Ubuntu) ou equivalente
+- **Linux** com sessão gráfica X11
+- `DISPLAY` configurado; **xprintidle** (opcional, para tempo ocioso): `sudo apt install xprintidle`
 
 ## Estrutura do projeto
 
-- `main.go` — Código principal (duas goroutines: monitoramento e sincronização)
+- `main.go` — Ponto de entrada, config, DB, goroutines de monitor e sync
+- `providers.go` — Interfaces `IdleProvider` e `WindowProvider`
+- `provider_x11.go` — Idle (xprintidle) e janela ativa (xgb) para X11
 - `schema.sql` — DDL de referência da tabela SQLite
 - `tracker-time.service` — Exemplo de unidade systemd
 
@@ -71,6 +73,7 @@ CREATE TABLE IF NOT EXISTS activity (
 	start_time DATETIME NOT NULL,
 	end_time DATETIME NOT NULL,
 	user_name TEXT NOT NULL DEFAULT '',
+	hostname TEXT NOT NULL DEFAULT '',
 	local_ip TEXT NOT NULL DEFAULT '',
 	network_ip TEXT NOT NULL DEFAULT ''
 );
@@ -127,7 +130,7 @@ sudo systemctl enable --now tracker-time
 
 ## Comportamento
 
-- **Goroutine de monitoramento:** a cada 2 s lê a janela ativa e o título via X11, verifica tempo ocioso (xprintidle). Atualiza ou insere um registro no SQLite; se o usuário estiver ocioso acima de 60 s, não atualiza.
-- **Goroutine de sincronização:** a cada 10 min busca registros com `is_synced = 0`, monta um JSON e envia `POST` para `https://api.dashboard.com/v1/ingest`. Em resposta 200 OK, marca os registros como `is_synced = 1`.
+- **Goroutine de monitoramento:** a cada 2 s lê a janela ativa e o título via X11, verifica tempo ocioso (xprintidle). Atualiza ou insere um registro no SQLite; se o usuário estiver ocioso acima do threshold configurado, não atualiza.
+- **Goroutine de sincronização:** a cada 10 min busca registros, monta um JSON e envia `POST` para a API de ingestão. Em resposta 200 OK, remove os registros locais.
 
 Encerramento: SIGINT ou SIGTERM (por exemplo ao parar o serviço systemd) finaliza o processo de forma limpa.
