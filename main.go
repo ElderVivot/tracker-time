@@ -212,7 +212,27 @@ func isWaylandGNOME() bool {
 
 // connectProviders tenta conectar ao provedor de janela/idle apropriado para a sessão.
 // Retorna windowProvider, idleProvider, cleanup e erro.
+//
+// A cada tentativa, limpa variáveis de sessão cacheadas e re-detecta via /proc.
+// Isso é necessário porque o serviço systemd pode iniciar antes da sessão gráfica;
+// sem essa re-detecção, conectaria via Xwayland (X11 fallback) e ficaria preso nele.
 func connectProviders() (WindowProvider, IdleProvider, func(), string, error) {
+	// Limpa variáveis de sessão para forçar re-detecção a cada tentativa.
+	// Sem isso, uma detecção parcial (ex: DISPLAY de Xwayland sem XDG_SESSION_TYPE)
+	// ficaria cacheada e impediria a detecção correta de Wayland na próxima tentativa.
+	for _, v := range []string{"XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "DISPLAY"} {
+		os.Unsetenv(v)
+	}
+
+	// Re-detecta variáveis da sessão gráfica via /proc.
+	_ = detectEnvFromProc([]string{
+		"XDG_SESSION_TYPE",
+		"XDG_CURRENT_DESKTOP",
+		"DBUS_SESSION_BUS_ADDRESS",
+		"WAYLAND_DISPLAY",
+		"DISPLAY",
+	})
+
 	if isWaylandGNOME() {
 		wp, cl, err := NewWaylandWindowProvider()
 		if err != nil {
@@ -221,7 +241,6 @@ func connectProviders() (WindowProvider, IdleProvider, func(), string, error) {
 		return wp, WaylandIdleProvider{}, cl, "Wayland/GNOME", nil
 	}
 	// Fallback: X11
-	os.Unsetenv("DISPLAY")
 	wp, cl, err := NewX11WindowProvider()
 	if err != nil {
 		return nil, nil, nil, "", fmt.Errorf("x11: %w", err)

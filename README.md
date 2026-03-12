@@ -173,6 +173,7 @@ Como **serviço de usuário** (recomendado para ter acesso ao DISPLAY/DBUS da se
 
 4. Verificar status:
    ```bash
+   systemctl --user restart tracker-time
    systemctl --user status tracker-time
    ```
 

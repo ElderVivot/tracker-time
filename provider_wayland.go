@@ -53,28 +53,57 @@ const (
 )
 
 // detectWaylandEnv verifica se estamos em sessão GNOME/Wayland e se DBUS_SESSION_BUS_ADDRESS
-// está disponível. Se não estiver, tenta detectar via /proc (similar ao detectX11Env).
+// está disponível. Se variáveis não estiverem no ambiente (ex: systemd user service),
+// tenta detectar via /proc.
 func detectWaylandEnv() error {
+	// Tenta importar variáveis da sessão gráfica via /proc (necessário em systemd user services).
+	_ = detectEnvFromProc([]string{
+		"XDG_SESSION_TYPE",
+		"XDG_CURRENT_DESKTOP",
+		"DBUS_SESSION_BUS_ADDRESS",
+		"WAYLAND_DISPLAY",
+	})
+
 	if os.Getenv("XDG_SESSION_TYPE") != "wayland" {
-		return fmt.Errorf("XDG_SESSION_TYPE não é wayland")
+		return fmt.Errorf("XDG_SESSION_TYPE não é wayland (valor: %q)", os.Getenv("XDG_SESSION_TYPE"))
 	}
-	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
-		return nil
-	}
-	if err := detectDBusFromProc(); err != nil {
-		return fmt.Errorf("wayland: DBUS_SESSION_BUS_ADDRESS não encontrado: %w", err)
+	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
+		return fmt.Errorf("wayland: DBUS_SESSION_BUS_ADDRESS não encontrado")
 	}
 	return nil
 }
 
-// detectDBusFromProc varre /proc buscando processos do mesmo UID que tenham
-// DBUS_SESSION_BUS_ADDRESS definido (necessário quando rodando como serviço systemd).
-func detectDBusFromProc() error {
+// detectEnvFromProc varre /proc buscando um processo do mesmo UID que possua
+// TODAS as variáveis solicitadas, e importa-as de uma vez. Isso garante que as
+// variáveis venham da mesma sessão gráfica (ex: gnome-session-binary ou gnome-shell),
+// evitando misturar DISPLAY de Xwayland com XDG_SESSION_TYPE de outro processo.
+// Necessário quando rodando como serviço systemd (user service).
+func detectEnvFromProc(vars []string) error {
+	// Determina quais variáveis ainda precisam ser importadas.
+	var needed []string
+	for _, v := range vars {
+		if os.Getenv(v) == "" {
+			needed = append(needed, v)
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+
 	uid := uint32(os.Getuid())
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return err
 	}
+
+	// Para cada processo, tenta encontrar um que tenha TODAS as variáveis necessárias.
+	// Se não encontrar um processo perfeito, usa o que tiver mais variáveis.
+	type candidate struct {
+		env   map[string]string
+		count int
+	}
+	var best candidate
+
 	for _, e := range entries {
 		name := e.Name()
 		if !e.IsDir() || len(name) == 0 || name[0] < '1' || name[0] > '9' {
@@ -92,15 +121,46 @@ func detectDBusFromProc() error {
 		if err != nil {
 			continue
 		}
+
+		found := make(map[string]string)
 		for _, kv := range splitNull(data) {
-			if strings.HasPrefix(kv, "DBUS_SESSION_BUS_ADDRESS=") {
-				addr := strings.TrimPrefix(kv, "DBUS_SESSION_BUS_ADDRESS=")
-				os.Setenv("DBUS_SESSION_BUS_ADDRESS", addr)
-				return nil
+			for _, v := range needed {
+				if strings.HasPrefix(kv, v+"=") {
+					found[v] = strings.TrimPrefix(kv, v+"=")
+				}
 			}
 		}
+
+		if len(found) == len(needed) {
+			// Processo perfeito: tem todas as variáveis.
+			for k, v := range found {
+				os.Setenv(k, v)
+			}
+			return nil
+		}
+		if len(found) > best.count {
+			best = candidate{env: found, count: len(found)}
+		}
 	}
-	return fmt.Errorf("nenhum processo com DBUS_SESSION_BUS_ADDRESS encontrado")
+
+	// Nenhum processo teve tudo — usa o melhor candidato.
+	if best.count > 0 {
+		for k, v := range best.env {
+			os.Setenv(k, v)
+		}
+		// Reporta quais ficaram faltando.
+		var missing []string
+		for _, v := range needed {
+			if os.Getenv(v) == "" {
+				missing = append(missing, v)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("variáveis não encontradas em /proc: %s", strings.Join(missing, ", "))
+		}
+		return nil
+	}
+	return fmt.Errorf("nenhum processo com variáveis de sessão encontrado em /proc")
 }
 
 // splitNull divide bytes por \x00 e retorna strings.
