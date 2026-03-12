@@ -1,18 +1,73 @@
 # tracker-time
 
-Daemon de monitoramento de produtividade para Linux (**X11**). Roda em segundo plano, sem interface gráfica, registrando a janela ativa e o tempo de uso, e sincronizando com uma API REST.
+Daemon de monitoramento de produtividade para Linux (**X11** e **Wayland/GNOME**). Roda em segundo plano, sem interface gráfica, registrando a janela ativa e o tempo de uso, e sincronizando com uma API REST.
+
+O programa detecta automaticamente o tipo de sessão gráfica (`XDG_SESSION_TYPE`) e usa o provedor apropriado.
 
 ## Requisitos
 
 - **Go** 1.21+
-- **Linux** com sessão gráfica X11
-- `DISPLAY` configurado; **xprintidle** (opcional, para tempo ocioso): `sudo apt install xprintidle`
+- **Linux** com sessão gráfica X11 ou Wayland
+
+### X11
+
+- `DISPLAY` configurado
+- **xprintidle** (opcional, para tempo ocioso): `sudo apt install xprintidle`
+
+### Wayland (GNOME)
+
+- **GNOME Shell 45+**
+- Extensão **tracker-time@autmais** instalada e ativa (ver seção abaixo)
+
+#### Instalação da extensão GNOME Shell
+
+A extensão expõe a janela ativa via D-Bus, já que o Wayland não permite acesso direto como o X11.
+
+**Instalação por usuário** (padrão — instala em `~/.local/share/gnome-shell/extensions/`):
+
+```bash
+cd gnome-extension
+bash install.sh
+
+gnome-extensions enable tracker-time@autmais
+```
+
+**Instalação global** (todos os usuários — instala em `/usr/share/gnome-shell/extensions/`):
+
+```bash
+cd gnome-extension
+sudo bash install.sh --global
+```
+
+Na instalação global, cada usuário ainda precisa ativar a extensão individualmente:
+
+```bash
+gnome-extensions enable tracker-time@autmais
+```
+
+> **Importante:** Após instalar e ativar a extensão, é necessário **reiniciar a sessão GNOME** (logout/login) para que ela seja carregada pelo GNOME Shell.
+
+Para verificar se a extensão está ativa:
+
+```bash
+gnome-extensions show tracker-time@autmais
+# Estado deve ser: ACTIVE
+
+# Testar manualmente via D-Bus:
+gdbus call --session \
+  --dest org.gnome.Shell.Extensions.TrackerTime \
+  --object-path /org/gnome/Shell/Extensions/TrackerTime \
+  --method org.gnome.Shell.Extensions.TrackerTime.GetActiveWindow
+# Saída esperada: ('NomeDoProcesso', 'Título da Janela')
+```
 
 ## Estrutura do projeto
 
 - `main.go` — Ponto de entrada, config, DB, goroutines de monitor e sync
 - `providers.go` — Interfaces `IdleProvider` e `WindowProvider`
 - `provider_x11.go` — Idle (xprintidle) e janela ativa (xgb) para X11
+- `provider_wayland.go` — Idle (Mutter IdleMonitor) e janela ativa (extensão D-Bus) para Wayland/GNOME
+- `gnome-extension/` — Extensão GNOME Shell para expor janela ativa via D-Bus
 - `schema.sql` — DDL de referência da tabela SQLite
 - `tracker-time.service` — Exemplo de unidade systemd
 
@@ -91,7 +146,7 @@ nohup ./tracker-time > /tmp/tracker-time.log 2>&1 &
 
 ### Opção 2: systemd (recomendado)
 
-Como **serviço de usuário** (recomendado para ter acesso ao DISPLAY da sessão gráfica):
+Como **serviço de usuário** (recomendado para ter acesso ao DISPLAY/DBUS da sessão gráfica):
 
 1. Instale o binário, por exemplo:
 
@@ -130,7 +185,7 @@ sudo systemctl enable --now tracker-time
 
 ## Comportamento
 
-- **Goroutine de monitoramento:** a cada 2 s lê a janela ativa e o título via X11, verifica tempo ocioso (xprintidle). Atualiza ou insere um registro no SQLite; se o usuário estiver ocioso acima do threshold configurado, não atualiza.
+- **Goroutine de monitoramento:** a cada 2 s lê a janela ativa e o título (via X11/xgb ou Wayland/D-Bus), verifica tempo ocioso (xprintidle ou Mutter IdleMonitor). Atualiza ou insere um registro no SQLite; se o usuário estiver ocioso acima do threshold configurado, não atualiza.
 - **Goroutine de sincronização:** a cada 10 min busca registros, monta um JSON e envia `POST` para a API de ingestão. Em resposta 200 OK, remove os registros locais.
 
 Encerramento: SIGINT ou SIGTERM (por exemplo ao parar o serviço systemd) finaliza o processo de forma limpa.
