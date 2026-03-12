@@ -1,0 +1,7 @@
+{
+  "uuid": "tracker-time@autmais",
+  "name": "Tracker Time",
+  "description": "Expõe a janela ativa via D-Bus para o tracker-time",
+  "shell-version": ["45", "46", "47"],
+  "version": 1
+}

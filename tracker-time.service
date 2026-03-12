@@ -1,5 +1,5 @@
 [Unit]
-Description=Tracker Time - Monitoramento de produtividade (X11)
+Description=Tracker Time - Monitoramento de produtividade (X11/Wayland)
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -11,9 +11,9 @@ ExecStart=%h/.local/bin/tracker-time
 # Environment=TRACKER_DB_PATH=%h/.local/share/tracker-time/tracker.db
 # Environment=TRACKER_INGEST_URL=https://sua-api.com/v1/ingest
 # Environment=TRACKER_IDLE_THRESHOLD=1m
-# DISPLAY é auto-detectado pelo binário via /proc.
-# Descomente abaixo apenas se a auto-detecção falhar:
-# Environment=DISPLAY=:0
+
+# Auto-detecção: o binário detecta DISPLAY, DBUS_SESSION_BUS_ADDRESS,
+# XDG_SESSION_TYPE e XDG_CURRENT_DESKTOP via /proc quando ausentes.
 
 Restart=on-failure
 RestartSec=10
