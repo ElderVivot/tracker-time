@@ -1,4 +1,4 @@
-// tracker-time — Daemon de monitoramento de produtividade para Linux (X11).
+// tracker-time — Daemon de monitoramento de produtividade para Linux (X11 e Wayland/GNOME).
 // Roda em segundo plano, registra janela ativa e tempo, e sincroniza com API REST.
 package main
 
@@ -28,7 +28,7 @@ import (
 const (
 	monitorInterval      = 2 * time.Second  // Loop rápido: a cada 2s
 	syncInterval         = 10 * time.Minute // Loop lento: a cada 10min
-	connectRetryInterval = 30 * time.Second // Intervalo entre tentativas de conexão ao X11
+	connectRetryInterval = 30 * time.Second // Intervalo entre tentativas de conexão à sessão gráfica
 	defaultIdleThreshold = 2 * time.Second  // Tempo sem mouse/teclado para considerar inativo (configurável por env)
 	defaultIngestURL     = "https://api.dashboard.com/v1/ingest"
 	defaultTTL           = 168 * time.Hour  // 7 dias: registros mais antigos são apagados (TTL em app, SQLite não tem TTL nativo)
@@ -202,15 +202,42 @@ func initDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// --- Goroutine 1: Monitoramento (loop rápido, com auto-conexão/reconexão X11) ---
+// --- Detecção de sessão gráfica ---
+
+// isWaylandGNOME retorna true se a sessão é Wayland com GNOME.
+func isWaylandGNOME() bool {
+	return os.Getenv("XDG_SESSION_TYPE") == "wayland" &&
+		strings.Contains(strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP")), "gnome")
+}
+
+// connectProviders tenta conectar ao provedor de janela/idle apropriado para a sessão.
+// Retorna windowProvider, idleProvider, cleanup e erro.
+func connectProviders() (WindowProvider, IdleProvider, func(), string, error) {
+	if isWaylandGNOME() {
+		wp, cl, err := NewWaylandWindowProvider()
+		if err != nil {
+			return nil, nil, nil, "", fmt.Errorf("wayland/gnome: %w", err)
+		}
+		return wp, WaylandIdleProvider{}, cl, "Wayland/GNOME", nil
+	}
+	// Fallback: X11
+	os.Unsetenv("DISPLAY")
+	wp, cl, err := NewX11WindowProvider()
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("x11: %w", err)
+	}
+	return wp, X11IdleProvider{}, cl, fmt.Sprintf("X11 (DISPLAY=%s)", os.Getenv("DISPLAY")), nil
+}
+
+// --- Goroutine 1: Monitoramento (loop rápido, com auto-conexão/reconexão) ---
 
 func runMonitor(ctx context.Context, db *sql.DB) {
 	identity := getMachineIdentity()
 	idleThreshold := getIdleThreshold()
-	idleProv := X11IdleProvider{}
 
 	var (
 		windowProv      WindowProvider
+		idleProv        IdleProvider
 		cleanup         func()
 		mu              sync.Mutex
 		currentProcess  string
@@ -236,19 +263,19 @@ func runMonitor(ctx context.Context, db *sql.DB) {
 					continue
 				}
 				lastConnAttempt = time.Now()
-				os.Unsetenv("DISPLAY")
-				wp, cl, err := NewX11WindowProvider()
+				wp, ip, cl, sessionName, err := connectProviders()
 				if err != nil {
 					if !loggedWaiting {
-						log.Printf("[monitor] aguardando sessão X11 (%v), retentando a cada %s", err, connectRetryInterval)
+						log.Printf("[monitor] aguardando sessão gráfica (%v), retentando a cada %s", err, connectRetryInterval)
 						loggedWaiting = true
 					}
 					continue
 				}
 				windowProv = wp
+				idleProv = ip
 				cleanup = cl
 				loggedWaiting = false
-				log.Printf("[monitor] conectado ao X11 (DISPLAY=%s)", os.Getenv("DISPLAY"))
+				log.Printf("[monitor] conectado: %s", sessionName)
 			}
 
 			idleDur, err := idleProv.IdleDuration()
@@ -261,11 +288,12 @@ func runMonitor(ctx context.Context, db *sql.DB) {
 
 			processName, windowTitle, err := windowProv.ActiveWindow()
 			if err != nil {
-				log.Printf("[monitor] conexão X11 perdida: %v — reconectando...", err)
+				log.Printf("[monitor] conexão perdida: %v — reconectando...", err)
 				if cleanup != nil {
 					cleanup()
 				}
 				windowProv = nil
+				idleProv = nil
 				cleanup = nil
 				mu.Lock()
 				currentID = 0
