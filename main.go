@@ -302,6 +302,37 @@ func runMonitor(ctx context.Context, db *sql.DB) {
 				continue
 			}
 			if idleDur > idleThreshold {
+				// Usuário está ocioso: registra como "unknown" para não perder o período.
+				mu.Lock()
+				now := time.Now()
+				isUnknown := currentProcess == "unknown" && currentTitle == "idle"
+				if isUnknown && currentID != 0 {
+					// Já está registrando idle — apenas atualiza end_time.
+					_, _ = db.Exec(
+						`UPDATE activity SET end_time = ? WHERE id = ?`,
+						now.Format(time.RFC3339), currentID,
+					)
+				} else {
+					// Fecha o registro da janela ativa anterior.
+					if currentID != 0 {
+						_, _ = db.Exec(
+							`UPDATE activity SET end_time = ? WHERE id = ?`,
+							now.Format(time.RFC3339), currentID,
+						)
+					}
+					// Cria registro "unknown" para o período ocioso.
+					res, err := db.Exec(
+						`INSERT INTO activity (process_name, window_title, start_time, end_time, user_name, hostname, local_ip, network_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+						"unknown", "idle", now.Format(time.RFC3339), now.Format(time.RFC3339),
+						identity.UserName, identity.Hostname, identity.LocalIP, identity.NetworkIP,
+					)
+					if err == nil {
+						currentID, _ = res.LastInsertId()
+						currentProcess = "unknown"
+						currentTitle = "idle"
+					}
+				}
+				mu.Unlock()
 				continue
 			}
 
